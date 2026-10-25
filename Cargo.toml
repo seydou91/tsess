@@ -1,0 +1,11 @@
+[package]
+name = "tsess"
+version = "0.1.0"
+edition = "2021"
+description = "Record terminal sessions for any AI coding harness (Claude Code, Codex, Gemini...) and resume them, with a tray menu."
+license = "MIT"
+repository = "https://github.com/seydou91/tsess"
+
+[dependencies]
+tao = "0.37.2"
+tray-icon = "0.26.1"
