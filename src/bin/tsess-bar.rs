@@ -1,5 +1,5 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
-//! tsess-bar — icône dans la barre de menus macOS : liste les sessions tsess, clic = reprise dans Terminal.
+//! tsess-bar — icône de barre de menus : sessions nommées + récentes Claude/Codex, clic = reprise dans un terminal.
 
 use std::{env, fs, path::PathBuf, process::Command, time::{Duration, Instant}};
 use tao::event::{Event, StartCause};
@@ -7,8 +7,20 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
-fn sessions() -> Vec<(String, String)> {
-    let d = PathBuf::from(env::var("HOME").unwrap_or_default()).join(".tsess");
+type State = (Vec<(String, String)>, Vec<(String, String)>);
+
+/// (sessions nommées, sessions récentes Claude/Codex) sous forme (id de menu, libellé).
+fn sessions() -> State {
+    let recent = tsess::discover(15).into_iter().map(|f| {
+        let folder = f.cwd.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+        let title: String = f.title.chars().take(45).collect();
+        (format!("s:{}", f.id), format!("[{}] {folder} — {title}", f.harness))
+    }).collect();
+    (named(), recent)
+}
+
+fn named() -> Vec<(String, String)> {
+    let d = tsess::home().join(".tsess");
     let mut v: Vec<_> = fs::read_dir(&d).into_iter().flatten().flatten()
         .filter_map(|e| {
             let name = e.file_name().to_str()?.strip_suffix(".meta")?.to_string();
@@ -21,14 +33,19 @@ fn sessions() -> Vec<(String, String)> {
     v
 }
 
-fn build_menu(list: &[(String, String)]) -> Menu {
+fn build_menu((list, recent): &State) -> Menu {
     let m = Menu::new();
     if list.is_empty() {
-        m.append(&MenuItem::new("Aucune session (tsess new <nom> -- claude)", false, None)).unwrap();
+        m.append(&MenuItem::new("Aucune session nommée", false, None)).unwrap();
     }
     for (name, cmd) in list {
         // l'id du menu = nom de session (déjà validé par tsess : [A-Za-z0-9-_.])
         m.append(&MenuItem::with_id(name.as_str(), format!("{name}  —  {cmd}"), true, None)).unwrap();
+    }
+    m.append(&PredefinedMenuItem::separator()).unwrap();
+    m.append(&MenuItem::new("Récentes (Claude, Codex)", false, None)).unwrap();
+    for (id, label) in recent {
+        m.append(&MenuItem::with_id(id.as_str(), label, true, None)).unwrap();
     }
     m.append(&PredefinedMenuItem::separator()).unwrap();
     m.append(&MenuItem::with_id("__new", "Nouvelle session…", true, None)).unwrap();
@@ -140,11 +157,11 @@ fn icon() -> Icon {
 fn main() {
     let event_loop = EventLoopBuilder::new().build();
     let mut tray = None;
-    let mut last = Vec::new();
+    let mut last: State = Default::default();
     let menu_rx = MenuEvent::receiver();
 
     event_loop.run(move |event, _, flow| {
-        // ponytail: sondage du dossier toutes les 2 s, passer à un watcher FS si ça gêne
+        // ponytail: relit ~/.tsess et les historiques toutes les 2 s, passer à un watcher FS si ça gêne
         *flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(2));
 
         if let Event::NewEvents(StartCause::Init) = event {
@@ -161,7 +178,7 @@ fn main() {
                 "__quit" => *flow = ControlFlow::Exit,
                 "__new" => new_session(),
                 "__login" => toggle_login(),
-                name => run_in_terminal(&["open", name]),
+                id => run_in_terminal(&["open", id.trim_start_matches("s:")]),
             }
         }
     });

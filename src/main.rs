@@ -1,7 +1,7 @@
 //! tsess — enregistre des sessions terminal (claude, codex, gemini, shell...) et les rouvre.
-//! Stockage : ~/.tsess/<nom>.meta (ligne 1 = cwd, ligne 2 = commande séparée par \t) + <nom>.log
+//! Stockage : ~/.tsess/<nom>.meta (cwd / commande séparée par \t / id de session du harness) + <nom>.log
 
-use std::{env, fs, path::PathBuf, process::{exit, Command}};
+use std::{env, fs, path::PathBuf, process::{exit, Command}, time::SystemTime};
 
 fn dir() -> PathBuf {
     let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).expect("HOME");
@@ -11,9 +11,18 @@ fn dir() -> PathBuf {
 }
 
 /// Commande de reprise propre à chaque harness ; sinon on relance la commande d'origine.
-fn resume_cmd(cmd: &[String]) -> Vec<String> {
+fn harness(cmd: &[String]) -> Option<&str> {
+    cmd.first().map(|c| c.rsplit(['/', '\\']).next().unwrap_or(c).trim_end_matches(".exe"))
+}
+
+/// Avec l'id du harness on reprend exactement la bonne session ; sinon la dernière du dossier.
+fn resume_cmd(cmd: &[String], id: Option<&str>) -> Vec<String> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect();
-    match cmd.first().map(|c| c.rsplit('/').next().unwrap_or(c)) {
+    match (harness(cmd), id) {
+        (Some(h @ ("claude" | "codex")), Some(id)) => return tsess::resume_by_id(h, id),
+        _ => {}
+    }
+    match harness(cmd) {
         Some("claude") => s(&["claude", "--continue"]),
         Some("codex") => s(&["codex", "resume", "--last"]),
         Some("gemini") => s(&["gemini", "--resume", "latest"]),
@@ -42,7 +51,7 @@ fn run_recorded(cwd: &str, log: &PathBuf, cmd: &[String]) -> i32 {
     })
 }
 
-fn load(name: &str) -> (String, Vec<String>) {
+fn load(name: &str) -> (String, Vec<String>, Option<String>) {
     let meta = fs::read_to_string(dir().join(format!("{name}.meta"))).unwrap_or_else(|_| {
         eprintln!("session inconnue: {name}");
         exit(1)
@@ -50,7 +59,23 @@ fn load(name: &str) -> (String, Vec<String>) {
     let mut l = meta.lines();
     let cwd = l.next().unwrap_or(".").to_string();
     let cmd = l.next().unwrap_or("").split('\t').filter(|s| !s.is_empty()).map(String::from).collect();
-    (cwd, cmd)
+    let id = l.next().filter(|s| !s.is_empty()).map(String::from);
+    (cwd, cmd, id)
+}
+
+/// Après la sortie du harness : retrouve la session qu'il vient de créer/utiliser dans ce dossier.
+fn capture_id(cmd: &[String], cwd: &str, since: SystemTime) -> Option<String> {
+    let h = harness(cmd)?;
+    tsess::discover(50).into_iter().find(|f| f.harness == h && f.cwd == cwd && f.mtime >= since).map(|f| f.id)
+}
+
+fn save(name: &str, cwd: &str, cmd: &[String], id: Option<&str>) {
+    fs::write(dir().join(format!("{name}.meta")), format!("{cwd}\n{}\n{}\n", cmd.join("\t"), id.unwrap_or(""))).unwrap();
+}
+
+fn ago(t: SystemTime) -> String {
+    let m = t.elapsed().map(|d| d.as_secs() / 60).unwrap_or(0);
+    match m { 0..=59 => format!("{m} min"), 60..=1439 => format!("{} h", m / 60), _ => format!("{} j", m / 1440) }
 }
 
 /// Question dans le terminal ; renvoie `default` si réponse vide.
@@ -70,7 +95,7 @@ fn valid_name(n: &str) -> bool {
 
 fn main() {
     let a: Vec<String> = env::args().skip(1).collect();
-    let usage = "usage:\n  tsess new [<nom> [-- cmd...]] (sans nom: assistant)\n  tsess open <nom>              reprend la session\n  tsess ls\n  tsess log <nom>               affiche l'enregistrement\n  tsess rm <nom>";
+    let usage = "usage:\n  tsess new [<nom> [-- cmd...]] (sans nom: assistant)\n  tsess open <nom|id>           reprend la session\n  tsess ls\n  tsess log <nom>               affiche l'enregistrement\n  tsess rm <nom>";
     match a.first().map(String::as_str) {
         Some("new") if a.len() == 1 => {
             // assistant interactif (utilisé par tsess-bar sous Linux/Windows)
@@ -88,20 +113,41 @@ fn main() {
             let mut cmd: Vec<String> = a.iter().skip(2).skip_while(|x| *x == "--").cloned().collect();
             if cmd.is_empty() { cmd.push(env::var("SHELL").unwrap_or(if cfg!(windows) { "powershell".into() } else { "/bin/sh".into() })) }
             let cwd = env::current_dir().unwrap().display().to_string();
-            fs::write(dir().join(format!("{name}.meta")), format!("{cwd}\n{}\n", cmd.join("\t"))).unwrap();
-            exit(run_recorded(&cwd, &dir().join(format!("{name}.log")), &cmd));
+            save(name, &cwd, &cmd, None);
+            let start = SystemTime::now();
+            let code = run_recorded(&cwd, &dir().join(format!("{name}.log")), &cmd);
+            if let Some(id) = capture_id(&cmd, &cwd, start) { save(name, &cwd, &cmd, Some(&id)) }
+            exit(code);
+        }
+        Some("open") if a.len() == 2 && !dir().join(format!("{}.meta", a[1])).exists() => {
+            // pas une session nommée : id (ou début d'id) d'une session Claude/Codex
+            let Some(f) = tsess::discover(500).into_iter().find(|f| a[1].len() >= 6 && f.id.starts_with(&a[1])) else {
+                eprintln!("session inconnue: {}", a[1]); exit(1)
+            };
+            let r = f.resume();
+            eprintln!("↻ {} dans {}", r.join(" "), f.cwd);
+            exit(run_recorded(&f.cwd, &dir().join(format!("{}.log", f.id)), &r));
         }
         Some("open") if a.len() == 2 => {
-            let (cwd, cmd) = load(&a[1]);
-            let r = resume_cmd(&cmd);
+            let (cwd, cmd, id) = load(&a[1]);
+            let r = resume_cmd(&cmd, id.as_deref());
             eprintln!("↻ {} dans {cwd}", r.join(" "));
-            exit(run_recorded(&cwd, &dir().join(format!("{}.log", a[1])), &r));
+            let start = SystemTime::now();
+            let code = run_recorded(&cwd, &dir().join(format!("{}.log", a[1])), &r);
+            // codex/claude peuvent créer un nouvel id à la reprise : on garde le plus récent
+            if let Some(nid) = capture_id(&cmd, &cwd, start) { save(&a[1], &cwd, &cmd, Some(&nid)) }
+            exit(code);
         }
         Some("ls") => {
             let mut v: Vec<_> = fs::read_dir(dir()).unwrap().flatten()
                 .filter_map(|e| e.file_name().to_str()?.strip_suffix(".meta").map(String::from)).collect();
             v.sort();
-            for n in v { let (cwd, cmd) = load(&n); println!("{n:20} {:30} {cwd}", cmd.join(" ")) }
+            if !v.is_empty() { println!("Sessions nommées :") }
+            for n in v { let (cwd, cmd, _) = load(&n); println!("  {n:20} {:24} {cwd}", cmd.join(" ")) }
+            println!("Récentes (tsess open <id>) :");
+            for f in tsess::discover(20) {
+                println!("  {:8} {:6} {:6} {:50} {}", &f.id[..8.min(f.id.len())], f.harness, ago(f.mtime), f.title.chars().take(50).collect::<String>(), f.cwd);
+            }
         }
         Some("log") if a.len() == 2 => {
             let _ = load(&a[1]);
@@ -122,9 +168,10 @@ mod t {
     #[test]
     fn resume_and_names() {
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(resume_cmd(&v(&["/usr/bin/claude", "-p"])), v(&["claude", "--continue"]));
-        assert_eq!(resume_cmd(&v(&["codex"])), v(&["codex", "resume", "--last"]));
-        assert_eq!(resume_cmd(&v(&["zsh"])), v(&["zsh"]));
+        assert_eq!(resume_cmd(&v(&["/usr/bin/claude", "-p"]), None), v(&["claude", "--continue"]));
+        assert_eq!(resume_cmd(&v(&["claude"]), Some("abc")), v(&["claude", "--resume", "abc"]));
+        assert_eq!(resume_cmd(&v(&["codex"]), None), v(&["codex", "resume", "--last"]));
+        assert_eq!(resume_cmd(&v(&["zsh"]), Some("x")), v(&["zsh"]));
         assert!(valid_name("audit-1") && !valid_name("../x") && !valid_name(""));
     }
 }
